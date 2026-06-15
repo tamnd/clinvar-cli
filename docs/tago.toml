@@ -1,0 +1,10 @@
+title       = "clinvar"
+baseURL     = "https://clinvar-cli.tamnd.com/"
+description = "A command line for clinvar."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/clinvar-cli"
