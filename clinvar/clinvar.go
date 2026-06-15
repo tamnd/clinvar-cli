@@ -1,200 +1,288 @@
 // Package clinvar is the library behind the clinvar command line:
-// the HTTP client, request shaping, and the typed data models for clinvar.
+// the HTTP client, request shaping, and the typed data models for NCBI ClinVar.
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// transient failures (429 and 5xx) that any public API throws under load.
 package clinvar
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"regexp"
+	"net/url"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to clinvar. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "clinvar/dev (+https://github.com/tamnd/clinvar-cli)"
+// Host is the eUtils hostname this client talks to, and the host the URI
+// driver in domain.go claims.
+const Host = "eutils.ncbi.nlm.nih.gov"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at clinvar.com; change it once you
-// know the real endpoints you want to read.
-const Host = "clinvar.com"
+const baseURL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
-
-// Client talks to clinvar over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config holds the runtime settings for the ClinVar client.
+type Config struct {
+	BaseURL   string
+	APIKey    string
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
+}
 
+// DefaultConfig returns a Config with sensible defaults: 400ms rate limit,
+// 3 retries, and a 30s timeout.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   baseURL,
+		Rate:      400 * time.Millisecond,
+		Retries:   3,
+		Timeout:   30 * time.Second,
+		UserAgent: "clinvar-cli/0.1.0 (github.com/tamnd/clinvar-cli)",
+	}
+}
+
+// Client talks to NCBI eUtils for ClinVar records.
+type Client struct {
+	cfg  Config
+	http *http.Client
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
+// NewClient returns a Client using the given Config.
+func NewClient(cfg Config) *Client {
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
-	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(backoff(attempt)):
-			}
+func (c *Client) wait() {
+	if c.cfg.Rate > 0 {
+		if since := time.Since(c.last); since < c.cfg.Rate {
+			time.Sleep(c.cfg.Rate - since)
 		}
-		body, retry, err := c.do(ctx, url)
-		if err == nil {
-			return body, nil
-		}
-		lastErr = err
-		if !retry {
-			return nil, err
-		}
-	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
-}
-
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
-	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, false, err
-	}
-	req.Header.Set("User-Agent", c.UserAgent)
-
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return nil, true, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		return nil, true, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
-	}
-
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, true, err
-	}
-	return b, false, nil
-}
-
-// pace blocks until at least Rate has passed since the previous request.
-func (c *Client) pace() {
-	if c.Rate <= 0 {
-		return
-	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
-		time.Sleep(wait)
 	}
 	c.last = time.Now()
 }
 
-func backoff(attempt int) time.Duration {
-	d := time.Duration(attempt) * 500 * time.Millisecond
-	if d > 5*time.Second {
-		d = 5 * time.Second
+func (c *Client) get(ctx context.Context, rawURL string, out any) error {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
+		if attempt > 0 {
+			d := time.Duration(attempt) * 500 * time.Millisecond
+			if d > 5*time.Second {
+				d = 5 * time.Second
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(d):
+			}
+		}
+		c.wait()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("User-Agent", c.cfg.UserAgent)
+		resp, err := c.http.Do(req)
+		if err != nil {
+			if attempt < c.cfg.Retries {
+				continue
+			}
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			if attempt < c.cfg.Retries {
+				continue
+			}
+			return fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
+		return json.NewDecoder(resp.Body).Decode(out)
 	}
-	return d
+	return fmt.Errorf("all retries exhausted")
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on clinvar.com. It is a stand-in for the typed records you
-// will model from the real clinvar endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `clinvar cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+func (c *Client) withAPIKey(rawURL string) string {
+	if c.cfg.APIKey == "" {
+		return rawURL
+	}
+	if strings.Contains(rawURL, "?") {
+		return rawURL + "&api_key=" + c.cfg.APIKey
+	}
+	return rawURL + "?api_key=" + c.cfg.APIKey
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
+// --- wire types (unexported) ---
+
+type wireSearch struct {
+	ESearchResult struct {
+		Count  string   `json:"count"`
+		IDList []string `json:"idlist"`
+	} `json:"esearchresult"`
+}
+
+type wireSummary struct {
+	Result map[string]json.RawMessage `json:"result"`
+}
+
+type wireVariant struct {
+	UID       string `json:"uid"`
+	ObjType   string `json:"obj_type"`
+	Accession string `json:"accession"`
+	Title     string `json:"title"`
+	NumSubmit int    `json:"num_submitters"`
+	GeneSort  string `json:"gene_sort"`
+	ChrSort   string `json:"chr_sort"`
+	ClinSig   struct {
+		Description  string `json:"description"`
+		ReviewStatus string `json:"review_status"`
+		LastEval     string `json:"last_evaluated"`
+	} `json:"clinical_significance"`
+	VarSet []struct {
+		MeasureID   string `json:"measure_id"`
+		MeasureName string `json:"measure_name"`
+		MeasureType string `json:"measure_type"`
+		Chr         string `json:"chr"`
+		Location    string `json:"location_value"`
+		CdnaChange  string `json:"cdna_change"`
+		ProtChange  string `json:"protein_change"`
+	} `json:"variation_set"`
+	Conditions []struct {
+		Name string `json:"name"`
+	} `json:"conditions"`
+}
+
+// --- public types ---
+
+// Variant is a single ClinVar variant record.
+type Variant struct {
+	ID            string   `json:"id"                       kit:"id"`
+	Accession     string   `json:"accession"`
+	Title         string   `json:"title"`
+	Gene          string   `json:"gene,omitempty"`
+	Chromosome    string   `json:"chromosome,omitempty"`
+	MeasureType   string   `json:"measure_type,omitempty"`
+	CdnaChange    string   `json:"cdna_change,omitempty"`
+	ProteinChange string   `json:"protein_change,omitempty"`
+	Significance  string   `json:"clinical_significance,omitempty"`
+	ReviewStatus  string   `json:"review_status,omitempty"`
+	LastEvaluated string   `json:"last_evaluated,omitempty"`
+	Conditions    []string `json:"conditions,omitempty"`
+	NumSubmitters int      `json:"num_submitters,omitempty"`
+}
+
+func toVariant(w wireVariant) *Variant {
+	conds := make([]string, 0, len(w.Conditions))
+	for _, c := range w.Conditions {
+		if c.Name != "" {
+			conds = append(conds, c.Name)
+		}
+	}
+	var mt, cdna, prot string
+	if len(w.VarSet) > 0 {
+		mt = w.VarSet[0].MeasureType
+		cdna = w.VarSet[0].CdnaChange
+		prot = w.VarSet[0].ProtChange
+	}
+	return &Variant{
+		ID:            w.UID,
+		Accession:     w.Accession,
+		Title:         w.Title,
+		Gene:          w.GeneSort,
+		Chromosome:    w.ChrSort,
+		MeasureType:   mt,
+		CdnaChange:    cdna,
+		ProteinChange: prot,
+		Significance:  w.ClinSig.Description,
+		ReviewStatus:  w.ClinSig.ReviewStatus,
+		LastEvaluated: w.ClinSig.LastEval,
+		Conditions:    conds,
+		NumSubmitters: w.NumSubmit,
+	}
+}
+
+// Search searches ClinVar for variants matching the query and returns IDs and
+// the total hit count.
+func (c *Client) Search(ctx context.Context, query string, limit, start int) ([]string, int, error) {
+	u := fmt.Sprintf("%s/esearch.fcgi?db=clinvar&term=%s&retmax=%d&retstart=%d&retmode=json",
+		c.cfg.BaseURL, url.QueryEscape(query), limit, start)
+	u = c.withAPIKey(u)
+	var w wireSearch
+	if err := c.get(ctx, u, &w); err != nil {
+		return nil, 0, err
+	}
+	count := 0
+	fmt.Sscanf(w.ESearchResult.Count, "%d", &count)
+	return w.ESearchResult.IDList, count, nil
+}
+
+// FetchVariants fetches variant details for the given IDs (up to ~500 per
+// call; callers should batch if needed).
+func (c *Client) FetchVariants(ctx context.Context, ids []string) ([]*Variant, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	u := fmt.Sprintf("%s/esummary.fcgi?db=clinvar&id=%s&retmode=json",
+		c.cfg.BaseURL, strings.Join(ids, ","))
+	u = c.withAPIKey(u)
+	var w wireSummary
+	if err := c.get(ctx, u, &w); err != nil {
 		return nil, err
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
+	rawUIDs, ok := w.Result["uids"]
+	if !ok {
+		return nil, fmt.Errorf("no uids in esummary response")
+	}
+	var uids []string
+	if err := json.Unmarshal(rawUIDs, &uids); err != nil {
 		return nil, err
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
+	var variants []*Variant
+	for _, uid := range uids {
+		raw, ok := w.Result[uid]
+		if !ok {
 			continue
 		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
+		var wv wireVariant
+		if err := json.Unmarshal(raw, &wv); err != nil {
+			continue
 		}
+		variants = append(variants, toVariant(wv))
 	}
-	return out, nil
+	return variants, nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
+// GetVariant fetches a single variant by its ClinVar numeric ID.
+func (c *Client) GetVariant(ctx context.Context, id string) (*Variant, error) {
+	variants, err := c.FetchVariants(ctx, []string{id})
+	if err != nil {
+		return nil, err
 	}
-	return out
+	if len(variants) == 0 {
+		return nil, fmt.Errorf("variant %s not found", id)
+	}
+	return variants[0], nil
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+// SearchAndFetch searches ClinVar and returns full Variant records.
+func (c *Client) SearchAndFetch(ctx context.Context, query string, limit, start int) ([]*Variant, int, error) {
+	ids, total, err := c.Search(ctx, query, limit, start)
+	if err != nil {
+		return nil, 0, err
 	}
-	return s
+	if len(ids) == 0 {
+		return nil, total, nil
+	}
+	variants, err := c.FetchVariants(ctx, ids)
+	if err != nil {
+		return nil, 0, err
+	}
+	return variants, total, nil
 }
